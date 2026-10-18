@@ -69,6 +69,7 @@ struct DeleteArm {
 }
 
 pub struct Runtime {
+    agent_memory: Mutex<Result<Store>>,
     pub(crate) web: Mutex<Option<crate::web::WebServer>>,
     pub store: Mutex<Store>,
     pub(crate) agents: Mutex<crate::agents::AgentServer>,
@@ -82,7 +83,9 @@ pub struct Runtime {
 }
 impl Runtime {
     pub fn new(store: Store) -> Arc<Self> {
+        let agent_memory = store.open_agent_memory();
         Arc::new(Self {
+            agent_memory: Mutex::new(agent_memory),
             web: Mutex::new(None),
             store: Mutex::new(store),
             agents: Mutex::new(crate::agents::AgentServer::default()),
@@ -94,6 +97,16 @@ impl Runtime {
             task: Mutex::new(None),
             syncing: tokio::sync::Mutex::new(()),
         })
+    }
+    pub(crate) fn with_agent_memory<T>(
+        &self,
+        operation: impl FnOnce(&mut Store) -> Result<T>,
+    ) -> Result<T> {
+        let mut memory = self
+            .agent_memory
+            .lock()
+            .map_err(|_| "Agent memory unavailable")?;
+        operation(memory.as_mut().map_err(|error| error.clone())?)
     }
     pub async fn start(self: &Arc<Self>) -> Result<u16> {
         let mut task = self.task.lock().map_err(|_| "Network unavailable")?;
@@ -430,6 +443,9 @@ impl Runtime {
                     json!({"name":f.name,"mime":f.mime,"data":if f.blob.is_empty(){f.data.clone()}else{s.blob(&f.blob)?}}),
                 )
             }
+            "agent_memory_snapshot" => self.with_agent_memory(|s| {
+                serde_json::to_value(s.snapshot()?).map_err(|e| e.to_string())
+            }),
             "agent_status" => Ok(crate::agents::status(self)),
             "web_phone_invite" => crate::web::start(self, true).await,
             "agent_grant" => {

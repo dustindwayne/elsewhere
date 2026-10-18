@@ -38,6 +38,6 @@ Desktop packages must be built on their target operating systems. The Android so
 
 Text-pattern affinity, explicit connections, and user-defined categories form spatial groups. Groups retain regional anchors. Movement settles, and remote changes animate in sequence. The current affinity calculation uses local word patterns rather than model embeddings.
 
-Data remains in the platform application-data directory. SQLite is not encrypted at rest. Peer exchange uses authenticated encrypted packets; the local phone dashboard uses HTTP session authentication. Agent access is separately granted through a loopback MCP endpoint.
+Data remains in the platform application-data directory. SQLite is not encrypted at rest. Peer exchange uses authenticated encrypted packets; the local phone dashboard uses HTTP session authentication. Agent access is separately granted through a loopback MCP endpoint. Agent memory is stored in its own SQLite database under agent-memory/, separate from user records, user search, user backups, and peer exchange. MCP tools and resources operate only on agent memory; the app can inspect it in Agent access.
 
 No CI build workflow is included.

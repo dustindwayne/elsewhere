@@ -88,6 +88,14 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) fn open_agent_memory(&self) -> Result<Self> {
+        let path = self.db.path().ok_or("User storage path is unavailable")?;
+        let dir = Path::new(path)
+            .parent()
+            .ok_or("User storage directory is unavailable")?;
+        Self::open(&dir.join("agent-memory"))
+    }
+
     pub(crate) fn setting(&self, key: &str) -> Option<String> {
         self.db
             .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
