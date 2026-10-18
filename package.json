@@ -9,7 +9,8 @@
     "android:build": "tauri android build --apk --target aarch64",
     "desktop:build": "tauri build --no-bundle",
     "test": "node --test tests/*.test.mjs && cargo test -p elsewhere-core",
-    "backend:dev": "cargo run -p elsewhere-core --bin preview"
+    "backend:dev": "cargo run -p elsewhere-core --bin preview",
+    "icons": "tauri icon assets/branding/elsewhere-icon.png --ios-color #000000"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10.1"

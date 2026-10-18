@@ -9,3 +9,5 @@
 .record-card{will-change:left,top,opacity}.record-card h3{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.record-card p{min-height:0}#editor-help{display:none}
 
 #phone-web-qr{max-width:240px;background:white;margin:18px 0}#phone-web-qr img{display:block;width:100%;height:auto}#phone-session-key{font:12px monospace}
+
+.header-mark{object-fit:contain;border-radius:10px;flex-shrink:0}.empty-brand{object-fit:contain;margin-bottom:22px;border-radius:22px}.welcome-content img.welcome-mark{display:block;margin:0 auto 25px;border-radius:20px}@media(max-width:680px){.header-mark{width:32px;height:32px}.empty-brand{width:96px;height:96px}}

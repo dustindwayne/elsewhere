@@ -316,6 +316,15 @@ pub fn start(
         };
         let app = Router::new()
             .route("/", get(index))
+            .route(
+                "/brand-icon.png",
+                get(|| async {
+                    (
+                        [("content-type", "image/png")],
+                        include_bytes!("../../web/brand-icon.png").as_slice(),
+                    )
+                }),
+            )
             .route("/session", get(session_status).post(session))
             .route("/command", post(command))
             .route(

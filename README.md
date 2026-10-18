@@ -1,4 +1,4 @@
-# Elsewhere
+![elsewhere. — externalized thought.](assets/branding/elsewhere-readme.png)
 
 Desktop application for Windows, Linux, and macOS with a Rust backend and an optional paired phone web surface.
 
