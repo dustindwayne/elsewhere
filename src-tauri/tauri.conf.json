@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Elsewhere",
+  "version": "0.2.0",
+  "identifier": "com.dustindwayne.elsewhere",
+  "build": {
+    "frontendDist": "../web"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Elsewhere. Externalized thought.",
+        "width": 1280,
+        "height": 850,
+        "minWidth": 360,
+        "minHeight": 500,
+        "backgroundColor": "#10101b"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "android": {
+      "minSdkVersion": 26
+    }
+  }
+}

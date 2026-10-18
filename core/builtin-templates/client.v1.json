@@ -1,0 +1,10 @@
+{
+  "id": "client", "version": 1, "name": "Client", "description": "A reusable contact record shared by print requests and other work.",
+  "elements": [
+    {"kind":"field","id":"name","label":"Client name","value":""},
+    {"kind":"field","id":"company","label":"Company","value":""},
+    {"kind":"field","id":"phone","label":"Phone","value":""},
+    {"kind":"field","id":"email","label":"Email","value":""},
+    {"kind":"field","id":"messenger","label":"Messenger / profile link","value":""}
+  ]
+}

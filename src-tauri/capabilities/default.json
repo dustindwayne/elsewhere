@@ -1,0 +1,1 @@
+{ "identifier": "default", "description": "Local Elsewhere window", "windows": ["main"], "permissions": ["core:default", "core:window:allow-destroy"] }

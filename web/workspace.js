@@ -1,0 +1,20 @@
+export const clone=value=>JSON.parse(JSON.stringify(value));
+export const native=!!window.__TAURI__;
+export async function api(name,args={}){if(native)return window.__TAURI__.core.invoke('command',{name,args});const response=await fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,args})});const result=await response.json();if(!response.ok)throw new Error(result.error||'The action could not be completed');return result;}
+export const message=error=>typeof error==='string'?error:error?.message||String(error);
+export const kindNames={plain:'Thought',thought:'Thought',note:'Note',list:'List',client:'Client','print-queue':'Print request'};
+export const kindHints={plain:'A thought can be unfinished. Let it land.',note:'Something to develop, understand, or come back to.',list:'One item at a time. A little structure goes a long way.',client:'A shared client record. Update it here; use it across your work.','print-queue':'Keep the request, client, files, and progress together.'};
+export function localId(){if(crypto.randomUUID)return crypto.randomUUID();const b=crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;return [...b].map((n,i)=>([4,6,8,10].includes(i)?'-':'')+n.toString(16).padStart(2,'0')).join('');}
+export class Workspace {
+ constructor(changed,status){this.records=[];this.templates=[];this.conflicts={};this.peers=[];this.active=null;this.pending=new Map();this.running=null;this.failed=false;this.changed=changed;this.status=status;this.pan={x:80,y:80};this.zoom=1;}
+ get(id){return this.records.find(r=>r.id===id);}
+ async load(){const snapshot=await api('snapshot');const editing=this.active&&this.get(this.active);const drafts=new Map([...this.pending.keys()].map(id=>[id,this.get(id)]));this.records=snapshot.thoughts;for(const [id,r]of drafts)if(r)this.replace(r);if(editing)this.replace(editing);this.conflicts=snapshot.conflicts;this.peers=snapshot.peers;this.node=snapshot.node;this.name=snapshot.name;this.changed();}
+ replace(record){const i=this.records.findIndex(r=>r.id===record.id);if(i<0)this.records.push(record);else this.records[i]=record;}
+ edit(record,parents=null){this.pending.set(record.id,{record,parents});this.failed=false;this.status('Saving here…');this.backupDraft(record);clearTimeout(this.timer);this.timer=setTimeout(()=>this.flush(),120);}
+ backupDraft(record){try{localStorage.setItem('elsewhere-draft-'+record.id,JSON.stringify(record));}catch{}}
+ async recoverDrafts(){const keys=Object.keys(localStorage).filter(k=>k.startsWith('elsewhere-draft-'));for(const key of keys){try{const draft=JSON.parse(localStorage.getItem(key));if(this.get(draft.id)&&draft.revision_id){this.replace(draft);this.edit(draft);}}catch{}}await this.flush();}
+ async flush(){if(this.running){await this.running;if(this.pending.size&&!this.failed)return this.flush();return;}
+  this.running=(async()=>{while(this.pending.size){const[id,item]=this.pending.entries().next().value;const sent=clone(item.record);this.pending.delete(id);try{const saved=await api('save',{thought:sent,parents:item.parents||[sent.revision_id],resolve:!!item.parents});const current=this.get(id);if(current){current.revision_id=saved.revision_id;current.parent_revision_ids=saved.parent_revision_ids;current.updated_at=saved.updated_at;current.provenance=saved.provenance;if(!this.pending.has(id))current.files=saved.files;}if(!this.pending.has(id))localStorage.removeItem('elsewhere-draft-'+id);if(item.parents)delete this.conflicts[id];}catch(error){if(!this.pending.has(id))this.pending.set(id,item);this.failed=true;this.status('Edits are waiting to save',true);throw error;}}this.failed=false;this.status('Saved on this device');this.changed();})();try{await this.running;}catch(error){this.onError?.(error);}finally{this.running=null;}}
+ async settled(){await this.flush();if(this.pending.size)throw new Error('Your edits are still here. Retry saving before continuing.');}
+ async create(kind,template_id,position){await this.settled();const record=await api('new_record',{kind,template_id,...position});this.replace(record);this.changed();return record;}
+}

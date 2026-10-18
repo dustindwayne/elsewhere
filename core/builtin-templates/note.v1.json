@@ -1,0 +1,4 @@
+{
+  "id": "note", "version": 1, "name": "Note", "description": "Developed information, reference material, and things worth keeping.",
+  "elements": [{"kind":"text","id":"body","label":"Notes","value":""}]
+}

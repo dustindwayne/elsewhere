@@ -1,0 +1,19 @@
+{
+  "id": "print-queue",
+  "version": 1,
+  "name": "Print request",
+  "description": "Track a print request, its client, files, and progress.",
+  "elements": [
+    { "kind": "field", "id": "name", "label": "Print name", "value": "" },
+    { "kind": "field", "id": "quantity", "label": "Quantity", "value": "1" },
+    { "kind": "field", "id": "status", "label": "Status", "value": "queued" },
+    { "kind": "field", "id": "priority", "label": "Priority", "value": "normal" },
+    { "kind": "field", "id": "due", "label": "Due date", "value": "" },
+    { "kind": "field", "id": "person", "label": "Customer", "value": "" },
+    { "kind": "list", "id": "links", "label": "Model / page links", "items": [] },
+    { "kind": "file", "id": "files", "label": "Files", "items": [], "primary": null },
+    { "kind": "text", "id": "notes", "label": "Notes", "value": "" },
+    { "kind": "button", "id": "mark-done", "label": "Mark done", "bind_slot": "print.complete" },
+    { "kind": "print_request", "id": "queue", "label": "Queue" }
+  ]
+}

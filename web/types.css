@@ -1,0 +1,14 @@
+/* Typed records share the same capture and persistence path. */
+#filter-type,#queue-status{font-size:11px;padding:9px 10px;max-width:145px;color:#c1b3d6;background:#1a1725}
+#add-template{font-size:12px}
+.editor-top #editor-kind{font-size:10px;letter-spacing:1.2px;padding:6px 8px;color:#c2aedf}
+.editor-content #body.compact-body{min-height:90px;height:110px}
+.list-row{display:flex;align-items:center;gap:10px;margin:10px 0}
+.list-row input[type=checkbox]{accent-color:#bba2ef;width:18px;height:18px;flex:none}
+.list-row input[type=text],.list-row input:not([type]){flex:1;width:0;background:#ffffff04;border:1px solid #ffffff0b}
+.list-row input.done{text-decoration:line-through;color:#877e99}
+.list-row button{padding:8px}
+#add-item-form{display:flex;gap:10px;margin:16px 0}
+#new-item{flex:1;width:0}
+#structured button{font-size:11px;padding:8px}
+@media(max-width:650px){.toolbar .view-switch{order:0}.toolbar #add{order:1}.toolbar #add-template{order:2}.toolbar #filter-type,.toolbar #queue-status{order:3;max-width:none;flex:1}.toolbar .search{order:4}.toolbar #add-template{font-size:11px;padding:9px}#structured{grid-template-columns:1fr}}
