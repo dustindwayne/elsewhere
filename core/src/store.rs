@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 use uuid::Uuid;
 
@@ -83,23 +84,231 @@ pub struct Snapshot {
 
 pub struct Store {
     db: Connection,
+    directory: PathBuf,
+    vault: Option<crate::vault::Vault<Arc<dyn crate::vault::KeyStore>>>,
+    keys: Option<Arc<dyn crate::vault::KeyStore>>,
+    _lock: Option<std::fs::File>,
+    sealed: bool,
     pub node: String,
     pub name: String,
 }
 
 impl Store {
-    pub(crate) fn open_agent_memory(&self) -> Result<Self> {
-        let path = self.db.path().ok_or("User storage path is unavailable")?;
-        let dir = Path::new(path)
-            .parent()
-            .ok_or("User storage directory is unavailable")?;
-        Self::open(&dir.join("agent-memory"))
+    #[cfg(test)]
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+    pub(crate) fn seal(&mut self) -> Result<()> {
+        if self.vault.is_some() && !self.sealed {
+            self.db = Connection::open_in_memory().map_err(|e| e.to_string())?;
+            self.sealed = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unlock(&mut self) -> Result<()> {
+        if self.sealed {
+            self.db = crate::vault::restore_database(
+                &self
+                    .vault
+                    .as_ref()
+                    .ok_or("Memory vault unavailable")?
+                    .read()?,
+            )?;
+            self.name = self
+                .db
+                .query_row("SELECT value FROM meta WHERE key='name'", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            self.sealed = false;
+        }
+        Ok(())
+    }
+    pub(crate) fn open_agent_memory(&self, agent: &str) -> Result<Self> {
+        if Uuid::parse_str(agent).is_err() && agent != "test" {
+            return Err("Invalid agent identity".into());
+        }
+        let directory = self.directory.join("agents").join(agent);
+        match &self.keys {
+            Some(keys) => Self::open_with_keys(&directory, keys.clone()),
+            None => {
+                #[cfg(test)]
+                {
+                    Self::open(&directory)
+                }
+                #[cfg(not(test))]
+                {
+                    Err("Encrypted memory key store is unavailable".into())
+                }
+            }
+        }
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        if let Some(vault) = &self.vault {
+            let bytes = self
+                .db
+                .serialize(rusqlite::DatabaseName::Main)
+                .map_err(|e| e.to_string())?;
+            vault.write(&bytes)?;
+        }
+        Ok(())
+    }
+
+    pub fn open_secure(dir: &Path) -> Result<Self> {
+        Self::open_with_keys(dir, Arc::new(crate::vault::SystemKeys))
+    }
+
+    fn open_with_keys(dir: &Path, keys: Arc<dyn crate::vault::KeyStore>) -> Result<Self> {
+        let vault = crate::vault::Vault::with_keys(dir, "memory", keys.clone())?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("memory.lock"))
+            .map_err(|e| e.to_string())?;
+        lock.try_lock()
+            .map_err(|_| "This memory store is already open in another Elsewhere process")?;
+        let legacy = dir.join("elsewhere.db");
+        if legacy.exists() {
+            Self::seal_legacy(dir, &vault, keys.clone())?;
+        }
+        let db = if vault.exists() {
+            crate::vault::restore_database(&vault.read()?)?
+        } else {
+            Connection::open_in_memory().map_err(|e| e.to_string())?
+        };
+        let mut store = Self::initialize(dir, db, Some(vault), Some(keys))?;
+        store._lock = Some(lock);
+        let legacy_agents = dir.join("agent-memory");
+        if legacy_agents.join("elsewhere.db").exists() {
+            Self::open_with_keys(&legacy_agents, store.keys.as_ref().unwrap().clone())?;
+        }
+        Ok(store)
+    }
+
+    fn seal_legacy(
+        dir: &Path,
+        vault: &crate::vault::Vault<Arc<dyn crate::vault::KeyStore>>,
+        keys: Arc<dyn crate::vault::KeyStore>,
+    ) -> Result<()> {
+        let legacy = dir.join("elsewhere.db");
+        let source = Connection::open(&legacy).map_err(|e| e.to_string())?;
+        source
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(|e| e.to_string())?;
+        source
+            .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .map_err(|_| "Close older Elsewhere processes before encrypting this space")?;
+        let mut image = zeroize::Zeroizing::new(
+            source
+                .serialize(rusqlite::DatabaseName::Main)
+                .map_err(|e| e.to_string())?
+                .to_vec(),
+        );
+        // A serialized WAL image must use rollback-journal header flags for deserialization.
+        if image.len() < 100 {
+            return Err("Invalid legacy database".into());
+        }
+        image[18] = 1;
+        image[19] = 1;
+        let restored = crate::vault::restore_database(&image)?;
+        let integrity: String = restored
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if integrity != "ok" {
+            return Err("The existing database failed its integrity check".into());
+        }
+        vault.write(&image)?;
+        if *vault.read()? != *image {
+            return Err("Encrypted migration verification failed".into());
+        }
+        // Preserve legacy backups as encrypted bytes before removing their plaintext copies.
+        let mut remove = Vec::new();
+        for filename in [
+            "elsewhere.db",
+            "elsewhere.db-wal",
+            "elsewhere.db-shm",
+            "elsewhere.db-journal",
+            "before-knowledge-v2.db",
+        ] {
+            let path = dir.join(filename);
+            if path.exists() {
+                let bytes =
+                    zeroize::Zeroizing::new(std::fs::read(&path).map_err(|e| e.to_string())?);
+                let backup = crate::vault::Vault::with_keys(
+                    dir,
+                    &format!("legacy-{filename}"),
+                    keys.clone(),
+                )?;
+                backup.write(&bytes)?;
+                if *backup.read()? != *bytes {
+                    return Err("Encrypted backup verification failed".into());
+                }
+                remove.push(path);
+            }
+        }
+        source
+            .execute_batch("ROLLBACK;")
+            .map_err(|e| e.to_string())?;
+        drop(source);
+        // The main file goes last so interrupted migrations are retried rather than skipped.
+        remove.sort_by_key(|p| p.file_name().is_some_and(|n| n == "elsewhere.db"));
+        for path in remove {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("Could not remove migrated plaintext storage: {e}"))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn setting(&self, key: &str) -> Option<String> {
         self.db
             .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
             .ok()
+    }
+
+    pub(crate) fn archive_draft(&self, record: Record) -> Result<()> {
+        Uuid::parse_str(&record.note.id).map_err(|_| "Invalid draft identity")?;
+        let draft_id = record.note.id.clone();
+        let revision = Revision {
+            id: record.note.revision_id.clone(),
+            entity: draft_id.clone(),
+            node: self.node.clone(),
+            parents: record.note.parent_revision_ids.clone(),
+            thought: Some(record),
+            at: Utc::now().to_rfc3339(),
+        };
+        validate(&revision)?;
+        self.db
+            .execute(
+                "INSERT OR REPLACE INTO drafts VALUES (?1,?2)",
+                params![draft_id, encode_revision(&revision)?],
+            )
+            .map_err(|e| e.to_string())?;
+        self.checkpoint()
+    }
+
+    pub(crate) fn drafts(&self) -> Result<Vec<Record>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT payload FROM drafts")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            decode_revision(&row.map_err(|e| e.to_string())?)?
+                .thought
+                .ok_or("Empty draft".into())
+        })
+        .collect()
+    }
+
+    pub(crate) fn clear_draft(&self, id: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM drafts WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        self.checkpoint()
     }
     pub(crate) fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.db
@@ -108,18 +317,34 @@ impl Store {
                 params![key, value],
             )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        self.checkpoint()
     }
+    #[cfg(test)]
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let db = Connection::open(dir.join("elsewhere.db")).map_err(|e| e.to_string())?;
+        Self::initialize(dir, db, None, None)
+    }
+    fn initialize(
+        dir: &Path,
+        db: Connection,
+        vault: Option<crate::vault::Vault<Arc<dyn crate::vault::KeyStore>>>,
+        keys: Option<Arc<dyn crate::vault::KeyStore>>,
+    ) -> Result<Self> {
+        let schema_before: i64 = db
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .map_err(|e| e.to_string())?;
         db.busy_timeout(std::time::Duration::from_secs(10))
             .map_err(|e| e.to_string())?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        db.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS revisions (id TEXT PRIMARY KEY, entity TEXT NOT NULL, json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS peers (id TEXT PRIMARY KEY, json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS templates (id TEXT PRIMARY KEY, json TEXT NOT NULL);").map_err(|e|e.to_string())?;
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS drafts(id TEXT PRIMARY KEY,payload BLOB NOT NULL);",
+        )
+        .map_err(|e| e.to_string())?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS blobs(id TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS revision_parents(child TEXT NOT NULL,parent TEXT NOT NULL,PRIMARY KEY(child,parent)); CREATE INDEX IF NOT EXISTS parent_lookup ON revision_parents(parent); CREATE INDEX IF NOT EXISTS record_revisions ON revisions(entity);").map_err(|e|e.to_string())?;
         db.execute(
             "INSERT OR IGNORE INTO meta VALUES ('node', ?1)",
@@ -137,8 +362,24 @@ impl Store {
         let name = db
             .query_row("SELECT value FROM meta WHERE key='name'", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
-        let mut store = Self { db, node, name };
+        let mut store = Self {
+            db,
+            directory: dir.to_owned(),
+            vault,
+            keys,
+            _lock: None,
+            sealed: false,
+            node,
+            name,
+        };
         store.migrate_storage(dir)?;
+        let schema_after: i64 = store
+            .db
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if store.db.total_changes() > 0 || schema_after != schema_before {
+            store.checkpoint()?;
+        }
         Ok(store)
     }
     pub fn revisions(&self) -> Result<Vec<Revision>> {
@@ -147,22 +388,17 @@ impl Store {
             .prepare("SELECT json FROM revisions ORDER BY id")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |r| Ok(r.get_ref(0)?.as_bytes()?.to_vec()))
             .map_err(|e| e.to_string())?;
-        rows.map(|r| {
-            serde_json::from_str(&r.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
-        })
-        .collect()
+        rows.map(|r| decode_revision(&r.map_err(|e| e.to_string())?))
+            .collect()
     }
     pub fn heads(&self) -> Result<BTreeMap<String, Vec<Revision>>> {
         let mut stmt=self.db.prepare("SELECT r.json FROM revisions r WHERE NOT EXISTS (SELECT 1 FROM revision_parents p WHERE p.parent=r.id)").map_err(|e|e.to_string())?;
         let all = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |r| Ok(r.get_ref(0)?.as_bytes()?.to_vec()))
             .map_err(|e| e.to_string())?
-            .map(|r| {
-                serde_json::from_str::<Revision>(&r.map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())
-            })
+            .map(|r| decode_revision(&r.map_err(|e| e.to_string())?))
             .collect::<Result<Vec<_>>>()?;
         let mut heads: BTreeMap<String, Vec<Revision>> = BTreeMap::new();
         for r in &all {
@@ -204,7 +440,7 @@ impl Store {
             .execute("UPDATE meta SET value=?1 WHERE key='name'", [name])
             .map_err(|e| e.to_string())?;
         self.name = name.into();
-        Ok(())
+        self.checkpoint()
     }
     pub fn listen_port(&self) -> u16 {
         self.db
@@ -222,7 +458,7 @@ impl Store {
                 [port.to_string()],
             )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        self.checkpoint()
     }
     pub fn create(&mut self, x: f64, y: f64) -> Result<Thought> {
         let record = self.blank_record(x, y);
@@ -412,7 +648,7 @@ impl Store {
             }
             tx.execute(
                 "INSERT OR IGNORE INTO revisions VALUES (?1,?2,?3)",
-                params![r.id, r.entity, serde_json::to_string(r).unwrap()],
+                params![r.id, r.entity, encode_revision(r)?],
             )
             .map_err(|e| e.to_string())?;
             for p in &r.parents {
@@ -423,15 +659,16 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             }
         }
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        self.checkpoint()
     }
     fn migrate_storage(&mut self, dir: &Path) -> Result<()> {
-        if self.setting("storage_version").as_deref() == Some("2") {
+        if self.setting("storage_version").as_deref() == Some("3") {
             return Ok(());
         }
         let mut revisions = self.revisions()?;
         let mut blobs = BTreeMap::new();
-        if !revisions.is_empty() {
+        if !revisions.is_empty() && self.vault.is_none() {
             let backup = dir.join("before-knowledge-v2.db");
             if !backup.exists() {
                 self.db
@@ -453,7 +690,7 @@ impl Store {
         for r in &revisions {
             tx.execute(
                 "UPDATE revisions SET json=?2 WHERE id=?1",
-                params![r.id, serde_json::to_string(r).unwrap()],
+                params![r.id, encode_revision(r)?],
             )
             .map_err(|e| e.to_string())?;
             for p in &r.parents {
@@ -465,11 +702,12 @@ impl Store {
             }
         }
         tx.execute(
-            "INSERT OR REPLACE INTO meta VALUES ('storage_version','2')",
+            "INSERT OR REPLACE INTO meta VALUES ('storage_version','3')",
             [],
         )
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        self.checkpoint()
     }
     pub fn revision_ids(&self) -> Result<Vec<String>> {
         let mut s = self
@@ -530,7 +768,8 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        self.checkpoint()
     }
     pub fn peers(&self) -> Result<Vec<Peer>> {
         let mut s = self
@@ -553,13 +792,13 @@ impl Store {
                 params![p.id, serde_json::to_string(p).unwrap()],
             )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        self.checkpoint()
     }
     pub fn remove_peer(&mut self, id: &str) -> Result<()> {
         self.db
             .execute("DELETE FROM peers WHERE id=?1", [id])
             .map_err(|e| e.to_string())?;
-        Ok(())
+        self.checkpoint()
     }
     pub fn import(&mut self, value: Value) -> Result<usize> {
         let mut items = value
@@ -683,8 +922,58 @@ impl Store {
                 params![id, serde_json::to_string(&p).unwrap()],
             )
             .map_err(|e| e.to_string())?;
-        Ok(())
+        self.checkpoint()
     }
+}
+
+fn encode_revision(revision: &Revision) -> Result<Vec<u8>> {
+    let mut metadata = revision.clone();
+    let (title, body) = match metadata.thought.as_mut() {
+        Some(record) => (
+            std::mem::take(&mut record.note.title),
+            std::mem::take(&mut record.note.body),
+        ),
+        None => (String::new(), String::new()),
+    };
+    let mut bytes = b"EWM1".to_vec();
+    for text in [&title, &body] {
+        let len = u32::try_from(text.len()).map_err(|_| "Memory text is too large")?;
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+    }
+    // Text stays raw UTF-8; structural metadata has compact binary framing.
+    bytes.extend(rmp_serde::to_vec_named(&metadata).map_err(|e| e.to_string())?);
+    Ok(bytes)
+}
+
+fn decode_revision(bytes: &[u8]) -> Result<Revision> {
+    if !bytes.starts_with(b"EWM1") {
+        return serde_json::from_slice(bytes).map_err(|e| e.to_string());
+    }
+    let mut remaining = &bytes[4..];
+    let mut text = Vec::new();
+    for _ in 0..2 {
+        if remaining.len() < 4 {
+            return Err("Truncated memory record".into());
+        }
+        let len = u32::from_le_bytes(remaining[..4].try_into().unwrap()) as usize;
+        remaining = &remaining[4..];
+        if len > remaining.len() {
+            return Err("Truncated memory text".into());
+        }
+        text.push(
+            std::str::from_utf8(&remaining[..len])
+                .map_err(|_| "Invalid memory text")?
+                .to_owned(),
+        );
+        remaining = &remaining[len..];
+    }
+    let mut revision: Revision = rmp_serde::from_slice(remaining).map_err(|e| e.to_string())?;
+    if let Some(record) = &mut revision.thought {
+        record.note.body = text.pop().unwrap();
+        record.note.title = text.pop().unwrap();
+    }
+    Ok(revision)
 }
 
 fn blob_hash(data: &str) -> Result<String> {
@@ -773,6 +1062,133 @@ fn validate(r: &Revision) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestKeys;
+    impl crate::vault::KeyStore for TestKeys {
+        fn load(&self, _: &str, _: bool) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+            Ok(zeroize::Zeroizing::new(vec![19; 32]))
+        }
+    }
+    #[test]
+    fn encrypted_store_migrates_and_persists_without_plaintext_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = Store::open(dir.path()).unwrap();
+        let record = legacy
+            .new_record(
+                "note",
+                None,
+                "Private title",
+                "Private body with \"quotes\"\nand Unicode 🧠",
+            )
+            .unwrap();
+        drop(legacy);
+        let mut secure = Store::open_with_keys(dir.path(), Arc::new(TestKeys)).unwrap();
+        assert_eq!(
+            secure.record(&record.note.id).unwrap().note.body,
+            record.note.body
+        );
+        assert!(!dir.path().join("elsewhere.db").exists());
+        assert!(!dir.path().join("before-knowledge-v2.db").exists());
+        assert!(Store::open_with_keys(dir.path(), Arc::new(TestKeys)).is_err());
+        secure.rename("Encrypted device").unwrap();
+        secure.archive_draft(record.clone()).unwrap();
+        assert_eq!(secure.drafts().unwrap()[0].note.body, record.note.body);
+        let created = secure
+            .new_record("thought", None, "New title", "New private body")
+            .unwrap();
+        let encoded = encode_revision(
+            &secure
+                .revisions()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.entity == created.note.id)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(encoded.starts_with(b"EWM1"));
+        assert!(encoded
+            .windows(created.note.body.len())
+            .any(|w| w == created.note.body.as_bytes()));
+        secure.seal().unwrap();
+        assert!(secure.sealed);
+        assert!(secure.db.prepare("SELECT * FROM revisions").is_err());
+        secure.unlock().unwrap();
+        assert!(!secure.sealed);
+        assert_eq!(
+            secure.record(&created.note.id).unwrap().note.body,
+            "New private body"
+        );
+        drop(secure);
+        for path in std::fs::read_dir(dir.path()).unwrap() {
+            let path = path.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "vault") {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(!bytes.windows(12).any(|w| w == b"Private body"));
+                assert!(!bytes.starts_with(b"SQLite format"));
+            }
+        }
+        let reopened = Store::open_with_keys(dir.path(), Arc::new(TestKeys)).unwrap();
+        assert_eq!(reopened.drafts().unwrap()[0].note.body, record.note.body);
+        reopened.clear_draft(&record.note.id).unwrap();
+        assert!(reopened.drafts().unwrap().is_empty());
+        assert_eq!(reopened.name, "Encrypted device");
+        assert_eq!(
+            reopened.record(&created.note.id).unwrap().note.body,
+            "New private body"
+        );
+        let runtime = crate::network::Runtime::new(reopened);
+        assert!(runtime.store.is_sealed());
+        {
+            let memory = runtime.store.lock().unwrap();
+            assert!(!memory.is_sealed());
+            assert_eq!(
+                memory.record(&created.note.id).unwrap().note.body,
+                "New private body"
+            );
+        }
+        assert!(runtime.store.is_sealed());
+    }
+    #[test]
+    fn sealed_memory_denies_missing_keys_and_discards_failed_writes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct SwitchKeys(Arc<AtomicBool>);
+        impl crate::vault::KeyStore for SwitchKeys {
+            fn load(&self, _: &str, _: bool) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+                if self.0.load(Ordering::SeqCst) {
+                    Err("locked".into())
+                } else {
+                    Ok(zeroize::Zeroizing::new(vec![23; 32]))
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locked = Arc::new(AtomicBool::new(false));
+        let secure =
+            Store::open_with_keys(dir.path(), Arc::new(SwitchKeys(locked.clone()))).unwrap();
+        let runtime = crate::network::Runtime::new(secure);
+        locked.store(true, Ordering::SeqCst);
+        assert!(runtime.store.lock().is_err());
+        assert!(runtime.store.is_sealed());
+        locked.store(false, Ordering::SeqCst);
+        {
+            let mut memory = runtime.store.lock().unwrap();
+            locked.store(true, Ordering::SeqCst);
+            assert!(memory.rename("Unconfirmed change").is_err());
+        }
+        locked.store(false, Ordering::SeqCst);
+        assert_eq!(runtime.store.lock().unwrap().name, "My Elsewhere");
+        assert!(runtime.store.is_sealed());
+    }
+    #[test]
+    fn schema_only_upgrade_survives_automatic_sealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Store::open_with_keys(dir.path(), Arc::new(TestKeys)).unwrap();
+        old.db.execute_batch("DROP TABLE drafts").unwrap();
+        old.checkpoint().unwrap();
+        drop(old);
+        let upgraded = Store::open_with_keys(dir.path(), Arc::new(TestKeys)).unwrap();
+        let runtime = crate::network::Runtime::new(upgraded);
+        assert!(runtime.store.lock().unwrap().drafts().unwrap().is_empty());
+    }
     #[test]
     fn attachments_deduplicate_and_existing_databases_migrate_with_backup() {
         use base64::{engine::general_purpose::STANDARD, Engine};

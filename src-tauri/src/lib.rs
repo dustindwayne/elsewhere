@@ -56,7 +56,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
-            let store = Store::open(&dir).map_err(std::io::Error::other)?;
+            let store = Store::open_secure(&dir).map_err(std::io::Error::other)?;
             let runtime = Runtime::new(store);
             let web_runtime = runtime.clone();
             tauri::async_runtime::spawn(async move {

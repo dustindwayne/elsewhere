@@ -55,15 +55,15 @@ Independent native clients can also pair and exchange changes. Each retains a lo
 
 ## Agent memory
 
-Agent memory and user knowledge are separate stores.
+Each agent has a separate memory store. User knowledge remains in its own store. Access to another agent’s memory or user knowledge is denied until the user grants it.
 
 | User knowledge | Agent memory |
 | --- | --- |
-| Thoughts and notes in the main space. | Persistent records available to connected agents. |
-| Used by the canvas, user search, backups, and peer exchange. | Stored in its own database and inspected through **Agent access**. |
-| Not accessible through the agent memory endpoint. | Exposed through a local MCP endpoint with individually revocable connections. |
+| Thoughts and notes in the main space. | Persistent records owned by one named agent. |
+| Used by the canvas, user search, backups, and peer exchange. | Stored in a separate encrypted vault and inspected through **Agent access**. |
+| Accessible to agents only with an explicit user grant. | Exposed through a local MCP endpoint with individually revocable connections. |
 
-In **Space options → Agent access**, create a named connection and choose read-only or read/add/edit access. Copy the generated endpoint and bearer token into a compatible MCP client. The token is displayed once.
+In **Space options → Agent access**, create a named connection and choose read-only or read/add/edit access. Copy the generated endpoint and bearer token into a compatible MCP client. The token is displayed once. Expand **Shared memory permissions** on a connection to grant or revoke read or read-and-edit access to a specific store. Tools accept an optional `store` owner ID (`user` for user knowledge); omitting it selects the agent’s own store. MCP resources expose only the connection’s own store.
 
 Available operations:
 
@@ -118,7 +118,7 @@ A Windows packaging helper is also available:
 npm test
 ```
 
-The test suite covers record persistence, revision conflicts, attachments, agent isolation, authenticated phone sessions, peer exchange, spatial settling, and sequential visual updates.
+The test suite covers encrypted migration and reopening, tamper and wrong-key rejection, cross-store permission boundaries, record revisions, attachments, authenticated phone sessions, peer exchange, spatial settling, and sequential visual updates. Windows key-store integration has a separate opt-in test; macOS, Linux, and Android runtime encryption still require device verification.
 
 <details>
 <summary><strong>Architecture and data</strong></summary>
@@ -136,12 +136,14 @@ The test suite covers record persistence, revision conflicts, attachments, agent
 
 ```text
 Application data/
-├── elsewhere.db                User knowledge and application settings
-└── agent-memory/
-    └── elsewhere.db            Agent memory
+├── <owner-hash>.vault          Encrypted user knowledge and settings
+├── memory.lock                Exclusive process lock, no memory content
+└── agents/
+    └── <agent-id>/
+        └── <owner-hash>.vault  Encrypted memory for one agent
 ```
 
-Records are stored locally in SQLite. Attachments are deduplicated by content hash. Revision history preserves earlier content and conflicting edits.
+Records use an in-memory SQLite index persisted as an authenticated AES-256-GCM vault. Titles and bodies use raw UTF-8 with length framing; revision metadata uses MessagePack rather than JSON documents. MCP, import/export, and network messages retain their protocol formats. Attachments are deduplicated by content hash. Revision history preserves earlier content and conflicting edits. Each save atomically replaces the encrypted vault; this currently rewrites the complete store, so large stores require further performance work.
 
 Templates are inert, versioned data. Installed template packages require a valid signature and supported element types.
 
@@ -151,7 +153,11 @@ Templates are inert, versioned data. Installed template packages require a valid
 - Phone sessions use HttpOnly, SameSite cookies over HTTP; this dashboard connection is not encrypted by TLS.
 - Native peer exchanges use authenticated encrypted packets.
 - Agent connections use separate bearer tokens on a loopback MCP listener.
-- SQLite databases are not encrypted at rest.
+- Persisted memory is always encrypted, including while the app is open. Keys live in the operating-system credential store, not alongside the vault. Windows uses Credential Manager; macOS uses Keychain; Linux requires an available Secret Service; Android uses its native Keystore-backed credential adapter.
+- The backend opens user memory only while an operation holds access, then closes the decrypted database. An agent store is opened for a request and dropped afterward. The active interface necessarily holds the records it is displaying. Keys are fetched per encryption/decryption operation. This does not promise secure erasure of process memory, swap, or crash dumps, or automatic device-lock detection.
+- Missing or inaccessible keys fail closed. There is no plaintext fallback. Vault files are bound to their workspace and owner; copying them alone to another device does not transfer access. A key recovery/export workflow is not implemented.
+- Existing databases are checked, copied to verified encrypted storage, and their plaintext files removed. Legacy backups and the former shared agent store are preserved encrypted; they are not automatically assigned to an agent. Removing old files does not guarantee physical erasure from disks or previous backups.
+- New drafts stay in application memory until the backend confirms an encrypted save. Browser local storage no longer receives new plaintext drafts; pending unsaved edits need a live backend. Existing browser drafts are copied to encrypted backend storage before their plaintext browser entries are removed. Drafts for missing records remain archived rather than being imported into the space. Deliberate JSON exports remain plaintext.
 
 The backend development preview can be started with `npm run backend:dev`. The desktop application remains the primary executable.
 

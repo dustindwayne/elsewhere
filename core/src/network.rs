@@ -69,9 +69,8 @@ struct DeleteArm {
 }
 
 pub struct Runtime {
-    agent_memory: Mutex<Result<Store>>,
     pub(crate) web: Mutex<Option<crate::web::WebServer>>,
-    pub store: Mutex<Store>,
+    pub store: MemoryStore,
     pub(crate) agents: Mutex<crate::agents::AgentServer>,
     discovery: Mutex<Option<mdns_sd::ServiceDaemon>>,
     nearby: Mutex<HashMap<String, String>>,
@@ -81,13 +80,45 @@ pub struct Runtime {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     syncing: tokio::sync::Mutex<()>,
 }
+
+pub struct MemoryStore(Mutex<Store>);
+pub struct MemoryGuard<'a>(std::sync::MutexGuard<'a, Store>);
+impl MemoryStore {
+    #[cfg(test)]
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.0.lock().unwrap().is_sealed()
+    }
+    fn new(mut store: Store) -> Self {
+        let _ = store.seal();
+        Self(Mutex::new(store))
+    }
+    pub fn lock(&self) -> Result<MemoryGuard<'_>> {
+        let mut store = self.0.lock().map_err(|_| "Memory unavailable")?;
+        store.unlock()?;
+        Ok(MemoryGuard(store))
+    }
+}
+impl std::ops::Deref for MemoryGuard<'_> {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for MemoryGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.0
+    }
+}
+impl Drop for MemoryGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.seal();
+    }
+}
 impl Runtime {
     pub fn new(store: Store) -> Arc<Self> {
-        let agent_memory = store.open_agent_memory();
         Arc::new(Self {
-            agent_memory: Mutex::new(agent_memory),
             web: Mutex::new(None),
-            store: Mutex::new(store),
+            store: MemoryStore::new(store),
             agents: Mutex::new(crate::agents::AgentServer::default()),
             discovery: Mutex::new(None),
             nearby: Mutex::new(HashMap::new()),
@@ -100,13 +131,13 @@ impl Runtime {
     }
     pub(crate) fn with_agent_memory<T>(
         &self,
+        agent: &str,
         operation: impl FnOnce(&mut Store) -> Result<T>,
     ) -> Result<T> {
-        let mut memory = self
-            .agent_memory
-            .lock()
-            .map_err(|_| "Agent memory unavailable")?;
-        operation(memory.as_mut().map_err(|error| error.clone())?)
+        // Serialize requests with owner commands and release decrypted agent data after each call.
+        let owner = self.store.lock().map_err(|_| "Memory unavailable")?;
+        let mut memory = owner.open_agent_memory(agent)?;
+        operation(&mut memory)
     }
     pub async fn start(self: &Arc<Self>) -> Result<u16> {
         let mut task = self.task.lock().map_err(|_| "Network unavailable")?;
@@ -114,14 +145,14 @@ impl Runtime {
             return Ok(port);
         }
         // Binding does not grant note access; every exchange is authenticated and encrypted.
-        let preferred = self.store.lock().unwrap().listen_port();
+        let preferred = self.store.lock()?.listen_port();
         let listener = std::net::TcpListener::bind(("0.0.0.0", preferred))
             .or_else(|_| std::net::TcpListener::bind(("0.0.0.0", 0)))
             .map_err(|e| format!("Nearby connections unavailable: {e}"))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-        self.store.lock().unwrap().set_listen_port(port)?;
+        self.store.lock()?.set_listen_port(port)?;
         *self.port.lock().unwrap() = Some(port);
         let app = Router::new()
             .route("/exchange/{channel}", post(exchange))
@@ -142,7 +173,11 @@ impl Runtime {
         let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
             return;
         };
-        let node = self.store.lock().unwrap().node.clone();
+        let Ok(store) = self.store.lock() else {
+            return;
+        };
+        let node = store.node.clone();
+        drop(store);
         let props = [("node", node.as_str()), ("version", "2")];
         let Ok(info) = mdns_sd::ServiceInfo::new(
             "_elsewhere._tcp.local.",
@@ -215,7 +250,7 @@ impl Runtime {
         validate_address(&format!("{ip}:{port}"))?;
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
-        let store = self.store.lock().unwrap();
+        let store = self.store.lock()?;
         let invite = Invite {
             version: 2,
             node: store.node.clone(),
@@ -267,7 +302,7 @@ impl Runtime {
         Uuid::parse_str(&invite.node).map_err(|_| "Invalid node")?;
         validate_address(&invite.address)?;
         decode_key(&invite.key)?;
-        if self.store.lock().unwrap().node == invite.node {
+        if self.store.lock()?.node == invite.node {
             return Err("Use this code on your other device".into());
         }
         self.start().await?;
@@ -279,7 +314,7 @@ impl Runtime {
             channel: invite.channel,
         };
         self.exchange_peer(&peer).await?;
-        self.store.lock().unwrap().put_peer(&peer)?;
+        self.store.lock()?.put_peer(&peer)?;
         Ok(json!({"paired":true,"name":peer.name}))
     }
     async fn exchange_peer(&self, peer: &Peer) -> Result<()> {
@@ -288,12 +323,12 @@ impl Runtime {
             .port
             .lock()
             .unwrap()
-            .unwrap_or_else(|| self.store.lock().unwrap().listen_port());
+            .unwrap_or(self.store.lock()?.listen_port());
         let mut remote_known = HashSet::<String>::new();
         let mut remote_blobs = Vec::<String>::new();
         for phase in 0..2 {
             let request = {
-                let s = self.store.lock().unwrap();
+                let s = self.store.lock()?;
                 Exchange {
                     recipient: peer.id.clone(),
                     node: s.node.clone(),
@@ -356,7 +391,7 @@ impl Runtime {
             }
             let packet: Packet = serde_json::from_slice(&bytes).map_err(|_| "Invalid reply")?;
             let reply: Exchange = open(&peer.key, &packet)?;
-            let mut s = self.store.lock().unwrap();
+            let mut s = self.store.lock()?;
             if reply.node != peer.id || reply.recipient != s.node {
                 return Err("Wrong device identity".into());
             }
@@ -369,7 +404,7 @@ impl Runtime {
     }
     pub async fn sync(&self) -> Result<Value> {
         let _guard = self.syncing.lock().await;
-        let peers = self.store.lock().unwrap().peers()?;
+        let peers = self.store.lock()?.peers()?;
         let mut results = Vec::new();
         for mut peer in peers {
             let discovered = self.nearby.lock().unwrap().get(&peer.id).cloned();
@@ -383,7 +418,7 @@ impl Runtime {
                 result = self.exchange_peer(&peer).await;
             }
             if result.is_ok() {
-                self.store.lock().unwrap().put_peer(&peer)?;
+                self.store.lock()?.put_peer(&peer)?;
             }
             results.push(
                 json!({"id":peer.id,"name":peer.name,"ok":result.is_ok(),"error":result.err()}),
@@ -394,8 +429,7 @@ impl Runtime {
     pub fn arm(&self, id: &str) -> Result<Value> {
         let heads = self
             .store
-            .lock()
-            .unwrap()
+            .lock()?
             .heads()?
             .remove(id)
             .ok_or("Thought not found")?;
@@ -422,7 +456,7 @@ impl Runtime {
         if arm.token != token || arm.expires <= Instant::now() {
             return Err("Delete confirmation expired".into());
         }
-        self.store.lock().unwrap().delete(id, &arm.parents)
+        self.store.lock()?.delete(id, &arm.parents)
     }
     pub async fn command(self: &Arc<Self>, name: &str, args: Value) -> Result<Value> {
         let str_arg = |key: &str| {
@@ -431,8 +465,19 @@ impl Runtime {
                 .ok_or_else(|| format!("Missing {key}"))
         };
         match name {
+            "archive_draft" => {
+                let draft =
+                    serde_json::from_value(args["record"].clone()).map_err(|e| e.to_string())?;
+                self.store.lock()?.archive_draft(draft)?;
+                Ok(json!({}))
+            }
+            "drafts" => Ok(json!(self.store.lock()?.drafts()?)),
+            "clear_draft" => {
+                self.store.lock()?.clear_draft(str_arg("id")?)?;
+                Ok(json!({}))
+            }
             "get_file" => {
-                let s = self.store.lock().unwrap();
+                let s = self.store.lock()?;
                 let r = s.record(str_arg("id")?)?;
                 let f = r
                     .files
@@ -443,10 +488,26 @@ impl Runtime {
                     json!({"name":f.name,"mime":f.mime,"data":if f.blob.is_empty(){f.data.clone()}else{s.blob(&f.blob)?}}),
                 )
             }
-            "agent_memory_snapshot" => self.with_agent_memory(|s| {
-                serde_json::to_value(s.snapshot()?).map_err(|e| e.to_string())
-            }),
+            "agent_memory_snapshot" => {
+                let connections = crate::agents::status(self);
+                let mut thoughts = Vec::new();
+                for connection in connections["connections"].as_array().unwrap() {
+                    let snapshot = self
+                        .with_agent_memory(connection["id"].as_str().unwrap(), |s| s.snapshot())?;
+                    thoughts.extend(snapshot.thoughts);
+                }
+                Ok(json!({"thoughts":thoughts}))
+            }
             "agent_status" => Ok(crate::agents::status(self)),
+            "agent_permission" => {
+                crate::agents::permission(
+                    self,
+                    str_arg("id")?,
+                    str_arg("target")?,
+                    str_arg("mode")?,
+                )?;
+                Ok(json!({}))
+            }
             "web_phone_invite" => crate::web::start(self, true).await,
             "agent_grant" => {
                 crate::agents::grant(
@@ -461,7 +522,7 @@ impl Runtime {
                 Ok(json!({}))
             }
             "new_record" => {
-                let mut s = self.store.lock().unwrap();
+                let mut s = self.store.lock()?;
                 let mut r = s.new_record(
                     str_arg("kind")?,
                     args["template_id"].as_str(),
@@ -476,7 +537,7 @@ impl Runtime {
                 }
                 serde_json::to_value(r).map_err(|e| e.to_string())
             }
-            "search" => Ok(json!(self.store.lock().unwrap().search(
+            "search" => Ok(json!(self.store.lock()?.search(
                 args["query"].as_str().unwrap_or(""),
                 args["kind"].as_str(),
                 args["limit"].as_u64().unwrap_or(50) as usize
@@ -485,16 +546,16 @@ impl Runtime {
                 let id = str_arg("id")?;
                 Ok(json!(self
                     .store
-                    .lock()
-                    .unwrap()
+                    .lock()?
                     .revisions()?
                     .into_iter()
                     .filter(|r| r.entity == id)
                     .collect::<Vec<_>>()))
             }
-            "snapshot" => serde_json::to_value(self.store.lock().unwrap().snapshot()?)
-                .map_err(|e| e.to_string()),
-            "create" => serde_json::to_value(self.store.lock().unwrap().create(
+            "snapshot" => {
+                serde_json::to_value(self.store.lock()?.snapshot()?).map_err(|e| e.to_string())
+            }
+            "create" => serde_json::to_value(self.store.lock()?.create(
                 args["x"].as_f64().unwrap_or(0.0),
                 args["y"].as_f64().unwrap_or(0.0),
             )?)
@@ -505,7 +566,7 @@ impl Runtime {
                 let parents: Vec<String> =
                     serde_json::from_value(args["parents"].clone()).map_err(|e| e.to_string())?;
                 self.arms.lock().unwrap().remove(&t.note.id);
-                serde_json::to_value(self.store.lock().unwrap().commit(
+                serde_json::to_value(self.store.lock()?.commit(
                     t,
                     &parents,
                     args["resolve"].as_bool().unwrap_or(false),
@@ -513,7 +574,7 @@ impl Runtime {
                 .map_err(|e| e.to_string())
             }
             "rename" => {
-                self.store.lock().unwrap().rename(str_arg("name")?)?;
+                self.store.lock()?.rename(str_arg("name")?)?;
                 Ok(json!({}))
             }
             "arm_delete" => self.arm(str_arg("id")?),
@@ -538,17 +599,17 @@ impl Runtime {
                 Ok(json!({}))
             }
             "forget_peer" => {
-                self.store.lock().unwrap().remove_peer(str_arg("id")?)?;
+                self.store.lock()?.remove_peer(str_arg("id")?)?;
                 Ok(json!({}))
             }
             "export" => {
-                let s = self.store.lock().unwrap();
+                let s = self.store.lock()?;
                 Ok(
                     json!({"format":"elsewhere-v2","thoughts":s.snapshot()?.thoughts,"revisions":s.revisions()?,"blobs":s.blobs_missing(&[])?}),
                 )
             }
             "import" => {
-                let mut s = self.store.lock().unwrap();
+                let mut s = self.store.lock()?;
                 let data = args.get("data").ok_or("Missing export")?;
                 if data["format"] == "elsewhere-v1" || data["format"] == "elsewhere-v2" {
                     if data["format"] == "elsewhere-v2" {
@@ -566,11 +627,11 @@ impl Runtime {
                     Ok(json!({"imported":s.import(data.clone())?}))
                 }
             }
-            "templates" => Ok(json!(self.store.lock().unwrap().template_catalog()?)),
+            "templates" => Ok(json!(self.store.lock()?.template_catalog()?)),
             "install_template" => {
                 let p =
                     serde_json::from_value(args["package"].clone()).map_err(|e| e.to_string())?;
-                self.store.lock().unwrap().install_template(p)?;
+                self.store.lock()?.install_template(p)?;
                 Ok(json!({}))
             }
             _ => Err("Unknown command".into()),
@@ -592,7 +653,7 @@ async fn exchange(
         let peers = rt
             .store
             .lock()
-            .unwrap()
+            .map_err(|_| deny("Memory is locked"))?
             .peers()
             .map_err(|_| deny("Store unavailable"))?;
         if let Some(p) = peers.iter().find(|p| p.channel == channel) {
@@ -611,7 +672,7 @@ async fn exchange(
     if request.port == 0 || request.name.len() > 100 || request.name.trim().is_empty() {
         return Err(deny("Invalid device"));
     }
-    let mut s = rt.store.lock().unwrap();
+    let mut s = rt.store.lock().map_err(|_| deny("Memory is locked"))?;
     if request.recipient != s.node
         || request.node == s.node
         || expected.is_some_and(|id| id != request.node)

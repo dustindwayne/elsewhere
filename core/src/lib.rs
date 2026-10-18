@@ -5,6 +5,7 @@ pub mod network;
 pub mod signatures;
 pub mod store;
 pub mod templates;
+pub mod vault;
 
 pub type Result<T> = std::result::Result<T, String>;
 
